@@ -829,3 +829,4 @@ with tab3:
             st.line_chart(df2.set_index("date")[["exercise_min"]])
 
 st.caption("© AI 습관 트래커 (마법 요정 에디션) — 오늘의 체크가 내일의 마법이 되핑 ✨")
+
