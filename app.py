@@ -1,11 +1,11 @@
 # app.py
-# Streamlit: AI Habit Tracker (Weather fix: Geocoding -> lat/lon -> Weather)
+# Streamlit: AI Habit Tracker (Weather 401-friendly + key test + trimming + secrets fallback)
 from __future__ import annotations
 
 import json
 import random
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -34,7 +34,6 @@ HABITS = [
     ("😴", "수면"),
 ]
 
-# 도시 선택은 UI용 라벨, 실제 API는 표준 city + country code로 매핑
 CITY_OPTIONS: Dict[str, Dict[str, str]] = {
     "Seoul": {"q": "Seoul,KR"},
     "Busan": {"q": "Busan,KR"},
@@ -53,133 +52,168 @@ MODEL_NAME = "gpt-5-mini"
 
 
 # -----------------------------
-# API helpers (FIXED)
+# Small utils
 # -----------------------------
-def _owm_geocode(city_q: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    OpenWeatherMap Geocoding API:
-    city_q: "Seoul,KR" 형태 권장
-    returns: {"name":..., "lat":..., "lon":..., "country":...} or None
-    """
-    if not api_key:
-        return None
+def _clean_key(s: str) -> str:
+    # 사용자가 복붙할 때 앞뒤 공백/개행이 섞이는 경우가 매우 흔함
+    return (s or "").strip()
+
+
+def _safe_json_message(resp: requests.Response) -> str:
     try:
-        url = "https://api.openweathermap.org/geo/1.0/direct"
-        params = {"q": city_q, "limit": 1, "appid": api_key}
+        if "application/json" in (resp.headers.get("Content-Type") or ""):
+            j = resp.json()
+            if isinstance(j, dict) and j.get("message"):
+                return str(j["message"])
+        # fallback: raw text
+        t = resp.text.strip()
+        return t[:200] if t else "No response body"
+    except Exception:
+        return "Failed to parse error body"
+
+
+# -----------------------------
+# Weather (OpenWeatherMap) - Geocoding -> Weather
+# -----------------------------
+def _owm_geocode(city_q: str, api_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Returns (geo_result, debug_info)
+    debug_info:
+      {"ok": bool, "step": "geocode", "status_code": int, "message": str, ...}
+    """
+    api_key = _clean_key(api_key)
+    if not api_key:
+        return None, {"ok": False, "step": "geocode", "reason": "API key is empty"}
+
+    url = "https://api.openweathermap.org/geo/1.0/direct"
+    params = {"q": city_q, "limit": 1, "appid": api_key}
+
+    try:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
-            return None
-        arr = r.json()
-        if not isinstance(arr, list) or len(arr) == 0:
-            return None
-        item = arr[0] or {}
-        if "lat" not in item or "lon" not in item:
-            return None
-        return item
-    except Exception:
-        return None
-
-
-def get_weather(city_label: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Weather fetch strategy:
-    1) Geocode city -> lat/lon
-    2) Call weather by lat/lon (Celsius, Korean)
-    Failure -> returns None
-    """
-    if not api_key:
-        return None
-
-    city_q = CITY_OPTIONS.get(city_label, {}).get("q", city_label)
-
-    try:
-        geo = _owm_geocode(city_q, api_key)
-        if not geo:
-            return None
-
-        lat, lon = geo["lat"], geo["lon"]
-
-        url = "https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "appid": api_key,
-            "units": "metric",
-            "lang": "kr",
-        }
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-
-        weather = (data.get("weather") or [{}])[0]
-        main = data.get("main") or {}
-        wind = data.get("wind") or {}
-
-        return {
-            "city": f"{geo.get('name', city_label)}",
-            "country": geo.get("country"),
-            "temp_c": main.get("temp"),
-            "feels_like_c": main.get("feels_like"),
-            "humidity": main.get("humidity"),
-            "description": weather.get("description"),
-            "wind_mps": wind.get("speed"),
-        }
-    except Exception:
-        return None
-
-
-def get_weather_debug(city_label: str, api_key: str) -> Dict[str, Any]:
-    """
-    디버그용: 실패 원인을 UI에 보여주기 위해 status/message를 포함해 반환.
-    키는 절대 출력하지 않음.
-    """
-    if not api_key:
-        return {"ok": False, "reason": "OpenWeatherMap API Key가 비어있음"}
-
-    city_q = CITY_OPTIONS.get(city_label, {}).get("q", city_label)
-
-    # 1) geocode
-    try:
-        geo_url = "https://api.openweathermap.org/geo/1.0/direct"
-        geo_params = {"q": city_q, "limit": 1, "appid": api_key}
-        gr = requests.get(geo_url, params=geo_params, timeout=10)
-        if gr.status_code != 200:
-            return {
+            return None, {
                 "ok": False,
                 "step": "geocode",
-                "status_code": gr.status_code,
-                "message": (gr.json().get("message") if isinstance(gr.json(), dict) else str(gr.text)[:200]),
+                "status_code": r.status_code,
+                "message": _safe_json_message(r),
                 "query": city_q,
             }
-        arr = gr.json()
+        arr = r.json()
         if not isinstance(arr, list) or len(arr) == 0:
-            return {"ok": False, "step": "geocode", "reason": "도시 검색 결과 0개", "query": city_q}
-        geo = arr[0]
-        lat, lon = geo.get("lat"), geo.get("lon")
-        if lat is None or lon is None:
-            return {"ok": False, "step": "geocode", "reason": "lat/lon 없음", "query": city_q}
+            return None, {"ok": False, "step": "geocode", "reason": "도시 검색 결과 0개", "query": city_q}
 
-        # 2) weather
-        w_url = "https://api.openweathermap.org/data/2.5/weather"
-        w_params = {"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "lang": "kr"}
-        wr = requests.get(w_url, params=w_params, timeout=10)
-        if wr.status_code != 200:
-            j = wr.json() if "application/json" in wr.headers.get("Content-Type", "") else {}
-            return {
+        item = arr[0] or {}
+        if "lat" not in item or "lon" not in item:
+            return None, {"ok": False, "step": "geocode", "reason": "lat/lon 없음", "query": city_q}
+
+        return item, {"ok": True, "step": "geocode", "query": city_q}
+    except requests.Timeout:
+        return None, {"ok": False, "step": "geocode", "reason": "timeout(10s)", "query": city_q}
+    except Exception as e:
+        return None, {"ok": False, "step": "geocode", "reason": f"exception: {type(e).__name__}", "query": city_q}
+
+
+def _owm_weather_by_latlon(lat: float, lon: float, api_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Returns (weather_result, debug_info)
+    """
+    api_key = _clean_key(api_key)
+    if not api_key:
+        return None, {"ok": False, "step": "weather", "reason": "API key is empty"}
+
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "lang": "kr"}
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None, {
                 "ok": False,
                 "step": "weather",
-                "status_code": wr.status_code,
-                "message": (j.get("message") if isinstance(j, dict) else str(wr.text)[:200]),
+                "status_code": r.status_code,
+                "message": _safe_json_message(r),
                 "lat": lat,
                 "lon": lon,
             }
 
-        return {"ok": True, "query": city_q, "lat": lat, "lon": lon}
+        data = r.json()
+        weather = (data.get("weather") or [{}])[0]
+        main = data.get("main") or {}
+        wind = data.get("wind") or {}
+
+        return (
+            {
+                "temp_c": main.get("temp"),
+                "feels_like_c": main.get("feels_like"),
+                "humidity": main.get("humidity"),
+                "description": weather.get("description"),
+                "wind_mps": wind.get("speed"),
+            },
+            {"ok": True, "step": "weather", "lat": lat, "lon": lon},
+        )
+    except requests.Timeout:
+        return None, {"ok": False, "step": "weather", "reason": "timeout(10s)", "lat": lat, "lon": lon}
     except Exception as e:
-        return {"ok": False, "reason": f"예외 발생: {type(e).__name__}"}
+        return None, {"ok": False, "step": "weather", "reason": f"exception: {type(e).__name__}", "lat": lat, "lon": lon}
 
 
+def get_weather(city_label: str, api_key: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns (weather_data_or_None, debug_info)
+    debug_info includes ok/step/status/message.
+    """
+    city_q = CITY_OPTIONS.get(city_label, {}).get("q", city_label)
+
+    geo, geo_dbg = _owm_geocode(city_q, api_key)
+    if not geo:
+        return None, geo_dbg or {"ok": False, "step": "geocode", "reason": "unknown"}
+
+    lat, lon = geo["lat"], geo["lon"]
+    w, w_dbg = _owm_weather_by_latlon(lat, lon, api_key)
+    if not w:
+        return None, w_dbg or {"ok": False, "step": "weather", "reason": "unknown"}
+
+    out = {
+        "city": str(geo.get("name") or city_label),
+        "country": geo.get("country"),
+        "temp_c": w.get("temp_c"),
+        "feels_like_c": w.get("feels_like_c"),
+        "humidity": w.get("humidity"),
+        "description": w.get("description"),
+        "wind_mps": w.get("wind_mps"),
+    }
+    return out, {"ok": True, "step": "done", "query": city_q, "lat": lat, "lon": lon}
+
+
+def weather_error_hint(debug: Dict[str, Any]) -> str:
+    """
+    사용자에게 '정확한 조치'를 안내하기 위한 메시지.
+    특히 401(Invalid API key) 케이스를 명확히 설명.
+    """
+    if not debug:
+        return "알 수 없는 오류입니다."
+
+    if debug.get("status_code") == 401:
+        return (
+            "OpenWeatherMap API Key가 **유효하지 않습니다(401)**.\n\n"
+            "- 키 앞뒤 공백/줄바꿈이 섞였는지 확인\n"
+            "- OpenWeatherMap에서 발급한 키가 맞는지 확인\n"
+            "- 발급 직후라면 활성화까지 5~30분 걸릴 수 있어요\n"
+            "- 무료 플랜에서도 Geocoding/Current Weather는 사용 가능합니다"
+        )
+
+    if debug.get("reason", "").startswith("timeout"):
+        return "네트워크가 느려서 요청이 시간 초과(10초) 되었어요. 잠시 후 다시 시도해 주세요."
+
+    if debug.get("step") == "geocode" and debug.get("reason") == "도시 검색 결과 0개":
+        return "도시 검색 결과가 없어요. 도시명을 바꾸거나(Seoul/Busan 등) 다시 시도해 주세요."
+
+    return f"날씨 요청 실패: {debug.get('message') or debug.get('reason') or '원인 불명'}"
+
+
+# -----------------------------
+# Dog CEO
+# -----------------------------
 def _breed_from_dog_url(url: str) -> str:
     try:
         marker = "/breeds/"
@@ -213,7 +247,7 @@ def get_dog_image() -> Optional[Dict[str, str]]:
 def _get_openai_client(api_key: str) -> "OpenAI":
     if OpenAI is None:
         raise RuntimeError("openai 패키지가 설치되어 있지 않습니다. requirements.txt에 openai를 추가해 주세요.")
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=_clean_key(api_key))
 
 
 def _style_system_prompt(style: str) -> str:
@@ -238,6 +272,7 @@ def generate_report(
     dog_breed: Optional[str],
     coach_style: str,
 ) -> Optional[str]:
+    openai_api_key = _clean_key(openai_api_key)
     if not openai_api_key:
         return None
 
@@ -324,9 +359,9 @@ def _init_demo_records() -> List[Dict[str, Any]]:
     for i in range(6, 0, -1):
         d = today - timedelta(days=i)
         checked_count = rng.randint(1, 5)
-        mood = rng.randint(3, 9)
-        rate = round(checked_count / 5 * 100, 1)
-        out.append({"date": d.isoformat(), "checked_count": checked_count, "rate": rate, "mood": mood})
+        m = rng.randint(3, 9)
+        rate = round(checked_count / len(HABITS) * 100, 1)
+        out.append({"date": d.isoformat(), "checked_count": checked_count, "rate": rate, "mood": m})
     return out
 
 
@@ -356,18 +391,43 @@ def upsert_today_record(checked_count: int, mood: int):
     else:
         records.append(rec)
 
-    records_sorted = sorted(records, key=lambda x: x.get("date", ""))
-    st.session_state.records = records_sorted[-7:]
+    st.session_state.records = sorted(records, key=lambda x: x.get("date", ""))[-7:]
 
 
 # -----------------------------
-# Sidebar
+# Sidebar: keys + test
 # -----------------------------
 with st.sidebar:
     st.header("🔑 API 키 설정")
-    openai_api_key = st.text_input("OpenAI API Key", value="", type="password")
-    owm_api_key = st.text_input("OpenWeatherMap API Key", value="", type="password")
-    st.caption("OpenWeatherMap: Geocoding + Weather로 안정적으로 호출합니다.")
+
+    # Secrets fallback (배포 시 편의)
+    try:
+        default_openai = str(st.secrets.get("OPENAI_API_KEY", ""))  # type: ignore
+    except Exception:
+        default_openai = ""
+    try:
+        default_owm = str(st.secrets.get("OPENWEATHER_API_KEY", ""))  # type: ignore
+    except Exception:
+        default_owm = ""
+
+    openai_api_key = st.text_input("OpenAI API Key", value=default_openai, type="password")
+    owm_api_key = st.text_input("OpenWeatherMap API Key", value=default_owm, type="password")
+
+    st.divider()
+    st.subheader("🌦️ 날씨 키 테스트")
+
+    test_city = st.selectbox("테스트 도시", options=list(CITY_OPTIONS.keys()), index=0, key="test_city")
+    if st.button("날씨 키 테스트 실행", use_container_width=True):
+        _, dbg = get_weather(test_city, owm_api_key)
+        if dbg.get("ok"):
+            st.success("성공! OpenWeatherMap 키가 정상입니다.")
+        else:
+            st.error("실패! 아래 원인을 확인하세요.")
+            st.info(weather_error_hint(dbg))
+            with st.expander("디버그 상세"):
+                st.write(dbg)
+
+    st.caption("401이면 코드가 아니라 키 문제인 경우가 대부분입니다.")
 
 
 # -----------------------------
@@ -400,6 +460,7 @@ unchecked_habits = [name for name, v in habit_values.items() if not v]
 checked_count = len(checked_habits)
 achievement_rate = round(checked_count / len(HABITS) * 100, 1)
 
+# Keep today's record synced
 upsert_today_record(checked_count=checked_count, mood=mood)
 
 st.subheader("📌 오늘 요약")
@@ -417,8 +478,7 @@ btn = st.button("컨디션 리포트 생성", type="primary", use_container_widt
 
 if btn:
     with st.spinner("날씨와 강아지를 불러오는 중..."):
-        weather = get_weather(city_label, owm_api_key)
-        weather_dbg = get_weather_debug(city_label, owm_api_key)
+        weather, weather_dbg = get_weather(city_label, owm_api_key)
         dog = get_dog_image()
 
     st.session_state.last_weather = weather
@@ -437,6 +497,7 @@ if btn:
         )
     st.session_state.last_report = report
 
+# Results
 weather = st.session_state.last_weather
 dog = st.session_state.last_dog
 report = st.session_state.last_report
@@ -456,8 +517,9 @@ with left:
         )
     else:
         st.warning("날씨 정보를 불러오지 못했어요.")
-        with st.expander("🔧 날씨 디버그 정보(원인 확인)"):
-            st.write(weather_dbg if weather_dbg else {"ok": False, "reason": "디버그 정보 없음"})
+        st.info(weather_error_hint(weather_dbg or {}))
+        with st.expander("🔧 날씨 디버그 상세"):
+            st.write(weather_dbg if weather_dbg else {"ok": False, "reason": "no debug"})
 
 with right:
     st.markdown("### 🐶 오늘의 강아지")
@@ -471,7 +533,7 @@ st.markdown("### 📝 AI 코치 리포트")
 if report:
     st.markdown(report)
 else:
-    st.caption("아직 리포트가 없어요. 위 버튼을 눌러 생성해보세요.")
+    st.caption("아직 리포트가 없어요. 위 버튼을 눌러 생성해보세요. (OpenAI 키 필요)")
 
 st.markdown("### 🔗 공유용 텍스트")
 share_text = {
@@ -490,17 +552,17 @@ st.code(json.dumps(share_text, ensure_ascii=False, indent=2), language="json")
 with st.expander("📎 API 안내 / 준비물"):
     st.markdown(
         """
-**OpenWeatherMap 날씨가 안 될 때 체크**
-- API Key가 맞는지(오타/공백) 확인
-- 키가 활성화되어 있는지(발급 직후 5~30분 지연될 수 있음)
-- Free 플랜에서도 `Current Weather`와 `Geocoding`은 사용 가능
-- 디버그 expander에서 `status_code`가 401이면 키 문제, 404면 도시 검색 문제일 가능성이 큼
+**OpenWeatherMap 401(Invalid API key)일 때**
+- 키 오타/공백/줄바꿈이 가장 흔한 원인입니다(이 앱은 자동 trim 처리하지만, 중간에 공백이 섞인 경우는 그대로 실패합니다).
+- OpenWeatherMap에서 발급한 키가 맞는지 확인하세요.
+- 발급 직후에는 활성화까지 시간이 걸릴 수 있습니다(보통 5~30분).
+- 테스트 버튼으로 먼저 확인해보세요.
+
+**OpenAI**
+- OpenAI 키가 없으면 리포트 생성이 되지 않습니다.
 
 **Dog CEO**
 - 무료 공개 API라 간헐적 실패 가능
-
-**OpenAI**
-- 키가 없으면 리포트 생성 불가
 """
     )
 
